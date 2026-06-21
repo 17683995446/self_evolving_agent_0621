@@ -1,0 +1,89 @@
+phase1:
+  sensory:
+    collectors:
+      system:
+        enabled: true
+        interval: 0.1
+        history_size: 100
+    normalizer:
+      feature_order:
+        - cpu_percent
+        - memory_percent
+    noise_filter:
+      ema_alpha: 0.5
+  drive:
+    safe:
+      risk_weights:
+        cpu_high: 0.2
+        memory_high: 0.3
+      thresholds:
+        cpu_critical: 80.0
+        memory_critical: 85.0
+    gain:
+      error_history_size: 50
+    eff:
+      agent_cpu_limit: 20.0
+      agent_memory_limit: 20.0
+    weights:
+      safe_weight: 0.4
+      gain_weight: 0.4
+      eff_weight: 0.2
+      weight_smooth_alpha: 0.3
+  prediction:
+    low:
+      ema_alpha: 0.3
+      trend_beta: 0.1
+      horizon: 1
+    mid:
+      window_size: 5
+      horizon: 2
+    high:
+      n_clusters: 3
+      horizon: 5
+    anomaly_threshold: 3.0
+  adjustment:
+    enabled: true
+
+phase2:
+  task_pool:
+    pool:
+      max_size: 50
+    safe_gen:
+      enabled: true
+    gain_gen:
+      enabled: true
+    eff_gen:
+      enabled: true
+  decision:
+    exploration:
+      base_exploration_ratio: 0.3
+      min_exploration_ratio: 0.1
+      max_exploration_ratio: 0.5
+    task_selector:
+      strategy: priority
+    resource_balancer:
+      cpu_limit: 20.0
+      memory_limit: 20.0
+  memory:
+    cache:
+      max_cache_size: 100
+    store:
+      db_path: agent_memory_test.db
+
+phase3:
+  evolution:
+    snapshot:
+      max_snapshots: 3
+    refactor:
+      error_threshold: 0.3
+      stagnation_rounds: 50
+    feature:
+      enabled: true
+    review:
+      enabled: true
+    gap_threshold: 0.1
+    rollback_threshold: 0.1
+
+loop_interval: 0.1
+max_loops: 100
+log_level: DEBUG

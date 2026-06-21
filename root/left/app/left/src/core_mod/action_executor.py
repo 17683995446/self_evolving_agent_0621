@@ -1,0 +1,282 @@
+"""真实动作执行器
+
+将任务负载转换为可执行动作，支持 shell、HTTP、文件操作，并内置安全护栏。
+"""
+import shlex
+import subprocess
+import urllib.request
+import urllib.error
+from typing import Any, Dict, Final, List, Optional
+
+from root.left.app.left.src.core_mod.approval_gate import ApprovalGate
+from root.left.app.left.src.utils_main.exceptions import SafetyBoundaryException, ValidationError
+from root.left.app.left.src.utils_main.logger import logger
+from root.left.app.left.src.utils_main.validators import Validator
+
+
+class ActionResult:
+    """动作执行结果"""
+
+    def __init__(
+        self,
+        success: bool,
+        action_type: str,
+        stdout: str = "",
+        stderr: str = "",
+        returncode: Optional[int] = None,
+        data: Optional[Any] = None,
+        error: str = "",
+    ) -> None:
+        self.success: bool = success
+        self.action_type: str = action_type
+        self.stdout: str = stdout
+        self.stderr: str = stderr
+        self.returncode: Optional[int] = returncode
+        self.data: Any = data
+        self.error: str = error
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "action_type": self.action_type,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "returncode": self.returncode,
+            "data": self.data,
+            "error": self.error,
+        }
+
+
+class ActionExecutor:
+    """动作执行器"""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        logger.debug("[ActionExecutor.__init__] start")
+        Validator.require_type(config, dict, "config")
+        self.config: Final[Dict[str, Any]] = config
+        self.dry_run: bool = bool(config.get("dry_run", True))
+        self.timeout: float = float(config.get("timeout", 30.0))
+        self.allowed_shell_prefixes: List[str] = list(
+            config.get("allowed_shell_prefixes", ["echo", "cat", "ls", "pwd", "df", "du", "ps", "curl", "python"])
+        )
+        self.blocked_shell_patterns: List[str] = list(
+            config.get("blocked_shell_patterns", ["rm -rf /", "mkfs", ":(){ :|:& };:", "> /dev/sda"])
+        )
+        self.allowed_http_hosts: List[str] = list(config.get("allowed_http_hosts", ["localhost", "127.0.0.1"]))
+        self.blocked_file_paths: List[str] = list(config.get("blocked_file_paths", ["/etc/passwd", "/etc/shadow"]))
+        self.approval_gate = ApprovalGate(config.get("approval_gate", {"mode": "auto_pass"}))
+        logger.info(f"ActionExecutor initialized dry_run={self.dry_run} timeout={self.timeout}", "action")
+
+    def execute(self, payload: Dict[str, Any]) -> ActionResult:
+        logger.debug(f"[ActionExecutor.execute] payload={payload}")
+        Validator.require_type(payload, dict, "payload")
+        action_type = payload.get("action_type", "noop")
+        logger.info(f"[ActionExecutor.execute] action_type={action_type}", "action")
+        try:
+            self.approval_gate.check(action_type, payload)
+        except SafetyBoundaryException as exc:
+            logger.warning(f"[ActionExecutor.execute] approval rejected: {exc}", "action")
+            return ActionResult(success=False, action_type=action_type, error=str(exc))
+        if action_type == "shell":
+            return self._execute_shell(payload)
+        if action_type == "http_get":
+            return self._execute_http_get(payload)
+        if action_type == "http_post":
+            return self._execute_http_post(payload)
+        if action_type == "file_write":
+            return self._execute_file_write(payload)
+        if action_type == "file_read":
+            return self._execute_file_read(payload)
+        if action_type == "file_delete":
+            return self._execute_file_delete(payload)
+        if action_type == "noop":
+            return ActionResult(success=True, action_type="noop", stdout="noop executed")
+        return ActionResult(
+            success=False,
+            action_type=action_type,
+            error=f"Unknown action_type: {action_type}",
+        )
+
+    def _execute_shell(self, payload: Dict[str, Any]) -> ActionResult:
+        command = payload.get("command", "")
+        logger.info(f"[ActionExecutor._execute_shell] command={command}", "action")
+        if not isinstance(command, str) or not command.strip():
+            return ActionResult(success=False, action_type="shell", error="Empty command")
+        try:
+            self._validate_shell_command(command)
+        except SafetyBoundaryException as exc:
+            logger.warning(f"[ActionExecutor._execute_shell] blocked: {exc}", "action")
+            return ActionResult(success=False, action_type="shell", error=str(exc))
+        if self.dry_run:
+            logger.info(f"[ActionExecutor._execute_shell] dry_run: {command}", "action")
+            return ActionResult(success=True, action_type="shell", stdout=f"[dry_run] {command}")
+        try:
+            result = subprocess.run(
+                shlex.split(command),
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False,
+            )
+            return ActionResult(
+                success=result.returncode == 0,
+                action_type="shell",
+                stdout=result.stdout,
+                stderr=result.stderr,
+                returncode=result.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return ActionResult(success=False, action_type="shell", error=f"Timeout after {self.timeout}s")
+        except Exception as exc:
+            return ActionResult(success=False, action_type="shell", error=str(exc))
+
+    def _validate_shell_command(self, command: str) -> None:
+        for pattern in self.blocked_shell_patterns:
+            if pattern in command:
+                raise SafetyBoundaryException(
+                    "Blocked shell pattern detected",
+                    boundary="shell_command",
+                    attempted_action=command,
+                )
+        parts = shlex.split(command)
+        if not parts:
+            raise ValidationError("Empty shell command", field="command")
+        first = parts[0]
+        if self.allowed_shell_prefixes and first not in self.allowed_shell_prefixes:
+            raise SafetyBoundaryException(
+                f"Shell command not in allowed list: {first}",
+                boundary="shell_command",
+                attempted_action=command,
+            )
+
+    def _execute_http_get(self, payload: Dict[str, Any]) -> ActionResult:
+        url = payload.get("url", "")
+        logger.info(f"[ActionExecutor._execute_http_get] url={url}", "action")
+        if not isinstance(url, str) or not url.strip():
+            return ActionResult(success=False, action_type="http_get", error="Empty URL")
+        try:
+            self._validate_http_url(url)
+        except SafetyBoundaryException as exc:
+            return ActionResult(success=False, action_type="http_get", error=str(exc))
+        if self.dry_run:
+            return ActionResult(success=True, action_type="http_get", stdout=f"[dry_run] GET {url}")
+        try:
+            with urllib.request.urlopen(url, timeout=int(self.timeout)) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return ActionResult(success=True, action_type="http_get", stdout=body, returncode=resp.status, data=body[:1000])
+        except urllib.error.HTTPError as exc:
+            return ActionResult(success=False, action_type="http_get", error=f"HTTP {exc.code}")
+        except Exception as exc:
+            return ActionResult(success=False, action_type="http_get", error=str(exc))
+
+    def _execute_http_post(self, payload: Dict[str, Any]) -> ActionResult:
+        url = payload.get("url", "")
+        body = payload.get("body", "")
+        logger.info(f"[ActionExecutor._execute_http_post] url={url}", "action")
+        if not isinstance(url, str) or not url.strip():
+            return ActionResult(success=False, action_type="http_post", error="Empty URL")
+        try:
+            self._validate_http_url(url)
+        except SafetyBoundaryException as exc:
+            return ActionResult(success=False, action_type="http_post", error=str(exc))
+        if self.dry_run:
+            return ActionResult(success=True, action_type="http_post", stdout=f"[dry_run] POST {url}")
+        try:
+            data_bytes = body.encode("utf-8") if isinstance(body, str) else str(body).encode("utf-8")
+            req = urllib.request.Request(url, data=data_bytes, method="POST", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=int(self.timeout)) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+                return ActionResult(success=True, action_type="http_post", stdout=response_body, returncode=resp.status)
+        except Exception as exc:
+            return ActionResult(success=False, action_type="http_post", error=str(exc))
+
+    def _validate_http_url(self, url: str) -> None:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if self.allowed_http_hosts and host not in self.allowed_http_hosts:
+            raise SafetyBoundaryException(
+                f"HTTP host not in allowed list: {host}",
+                boundary="http_host",
+                attempted_action=url,
+            )
+
+    def _execute_file_write(self, payload: Dict[str, Any]) -> ActionResult:
+        path = payload.get("path", "")
+        content = payload.get("content", "")
+        logger.info(f"[ActionExecutor._execute_file_write] path={path}", "action")
+        try:
+            self._validate_file_path(path)
+        except SafetyBoundaryException as exc:
+            return ActionResult(success=False, action_type="file_write", error=str(exc))
+        if self.dry_run:
+            return ActionResult(success=True, action_type="file_write", stdout=f"[dry_run] write {path}")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return ActionResult(success=True, action_type="file_write", stdout=f"Wrote {path}")
+        except Exception as exc:
+            return ActionResult(success=False, action_type="file_write", error=str(exc))
+
+    def _execute_file_read(self, payload: Dict[str, Any]) -> ActionResult:
+        path = payload.get("path", "")
+        logger.info(f"[ActionExecutor._execute_file_read] path={path}", "action")
+        try:
+            self._validate_file_path(path)
+        except SafetyBoundaryException as exc:
+            return ActionResult(success=False, action_type="file_read", error=str(exc))
+        if self.dry_run:
+            return ActionResult(success=True, action_type="file_read", stdout=f"[dry_run] read {path}")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return ActionResult(success=True, action_type="file_read", stdout=content[:1000], data=content[:1000])
+        except Exception as exc:
+            return ActionResult(success=False, action_type="file_read", error=str(exc))
+
+    def _execute_file_delete(self, payload: Dict[str, Any]) -> ActionResult:
+        path = payload.get("path", "")
+        logger.info(f"[ActionExecutor._execute_file_delete] path={path}", "action")
+        try:
+            self._validate_file_path(path)
+        except SafetyBoundaryException as exc:
+            return ActionResult(success=False, action_type="file_delete", error=str(exc))
+        if self.dry_run:
+            return ActionResult(success=True, action_type="file_delete", stdout=f"[dry_run] delete {path}")
+        try:
+            import os
+            os.remove(path)
+            return ActionResult(success=True, action_type="file_delete", stdout=f"Deleted {path}")
+        except Exception as exc:
+            return ActionResult(success=False, action_type="file_delete", error=str(exc))
+
+    def get_state(self) -> Dict[str, Any]:
+        """获取执行器状态"""
+        return {
+            "dry_run": self.dry_run,
+            "timeout": self.timeout,
+            "allowed_shell_prefixes": self.allowed_shell_prefixes,
+            "blocked_shell_patterns": self.blocked_shell_patterns,
+            "allowed_http_hosts": self.allowed_http_hosts,
+            "blocked_file_paths": self.blocked_file_paths,
+        }
+
+    def reset(self) -> None:
+        """重置执行器到初始状态"""
+        logger.debug("[ActionExecutor.reset] called", "action")
+
+    def health_check(self) -> bool:
+        """健康检查"""
+        logger.debug("[ActionExecutor.health_check] called", "action")
+        return True
+
+    def _validate_file_path(self, path: str) -> None:
+        if not isinstance(path, str) or not path.strip():
+            raise ValidationError("Empty file path", field="path")
+        for blocked in self.blocked_file_paths:
+            if path.startswith(blocked) or path == blocked:
+                raise SafetyBoundaryException(
+                    f"File path blocked: {path}",
+                    boundary="file_path",
+                    attempted_action=path,
+                )

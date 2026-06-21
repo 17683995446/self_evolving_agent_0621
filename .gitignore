@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Test/coverage
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime/data
+.agent_pid
+.agent_port
+agent_memory*.db
+*.log
+reports/
+
+# OS
+.DS_Store
+Thumbs.db

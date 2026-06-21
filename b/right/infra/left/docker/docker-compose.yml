@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  agent:
+    build:
+      context: ../../..
+      dockerfile: b/right/infra/left/docker/Dockerfile
+    container_name: self_evolving_agent
+    environment:
+      - AGENT_ENV=prod
+      - PYTHONPATH=/app
+    volumes:
+      - agent_memory:/app/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 256M
+
+volumes:
+  agent_memory:
